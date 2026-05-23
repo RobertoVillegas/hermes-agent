@@ -237,6 +237,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "cursor-acp": ProviderConfig(
+        id="cursor-acp",
+        name="Cursor ACP",
+        auth_type="external_process",
+        inference_base_url="acp://cursor",
+        base_url_env_var="CURSOR_ACP_BASE_URL",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
