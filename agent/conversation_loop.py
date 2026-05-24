@@ -1140,7 +1140,13 @@ def run_conversation(
                         api_kwargs, on_first_delta=_stop_spinner
                     )
                 else:
-                    response = agent._interruptible_api_call(api_kwargs)
+                    agent._acp_on_first_delta = (
+                        _stop_spinner if agent._has_stream_consumers() else None
+                    )
+                    try:
+                        response = agent._interruptible_api_call(api_kwargs)
+                    finally:
+                        agent._acp_on_first_delta = None
                 
                 api_duration = time.time() - api_start_time
                 

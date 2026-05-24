@@ -19,7 +19,7 @@ import time
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from agent.file_safety import get_read_block_error, is_write_denied
 from agent.redact import redact_sensitive_text
@@ -357,6 +357,37 @@ class CopilotACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self._on_text_delta: Callable[[str], None] | None = None
+        self._on_reasoning_delta: Callable[[str], None] | None = None
+        self._on_first_delta: Callable[[], None] | None = None
+        self._first_delta_fired = False
+
+    def set_stream_callbacks(
+        self,
+        *,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_reasoning_delta: Callable[[str], None] | None = None,
+        on_first_delta: Callable[[], None] | None = None,
+    ) -> None:
+        """Wire live chunk delivery for WebUI/gateway stream consumers."""
+        self._on_text_delta = on_text_delta
+        self._on_reasoning_delta = on_reasoning_delta
+        self._on_first_delta = on_first_delta
+        self._first_delta_fired = False
+
+    def clear_stream_callbacks(self) -> None:
+        self.set_stream_callbacks()
+
+    def _maybe_fire_first_delta(self) -> None:
+        if self._first_delta_fired:
+            return
+        self._first_delta_fired = True
+        first_cb = self._on_first_delta
+        if first_cb is not None:
+            try:
+                first_cb()
+            except Exception:
+                pass
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -617,9 +648,23 @@ class CopilotACPClient:
             if isinstance(content, dict):
                 chunk_text = str(content.get("text") or "")
             if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
+                self._maybe_fire_first_delta()
                 text_parts.append(chunk_text)
+                cb = self._on_text_delta
+                if cb is not None:
+                    try:
+                        cb(chunk_text)
+                    except Exception:
+                        pass
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
+                self._maybe_fire_first_delta()
                 reasoning_parts.append(chunk_text)
+                cb = self._on_reasoning_delta
+                if cb is not None:
+                    try:
+                        cb(chunk_text)
+                    except Exception:
+                        pass
             return True
 
         if process.stdin is None:

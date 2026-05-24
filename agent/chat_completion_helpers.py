@@ -76,6 +76,23 @@ def _ra():
 
 
 
+def _wire_acp_stream_callbacks(agent, request_client) -> None:
+    """Forward live ACP session/update chunks to registered stream consumers."""
+    wire_fn = getattr(request_client, "set_stream_callbacks", None)
+    if wire_fn is None:
+        return
+    if not agent._has_stream_consumers():
+        clear_fn = getattr(request_client, "clear_stream_callbacks", None)
+        if clear_fn is not None:
+            clear_fn()
+        return
+    wire_fn(
+        on_text_delta=agent._fire_stream_delta,
+        on_reasoning_delta=agent._fire_reasoning_delta,
+        on_first_delta=getattr(agent, "_acp_on_first_delta", None),
+    )
+
+
 def interruptible_api_call(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
@@ -156,7 +173,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
                         api_kwargs=api_kwargs,
                     )
                 )
-                result["response"] = request_client.chat.completions.create(**api_kwargs)
+                _wire_acp_stream_callbacks(agent, request_client)
+                try:
+                    result["response"] = request_client.chat.completions.create(**api_kwargs)
+                finally:
+                    clear_fn = getattr(request_client, "clear_stream_callbacks", None)
+                    if clear_fn is not None:
+                        clear_fn()
         except Exception as e:
             result["error"] = e
         finally:

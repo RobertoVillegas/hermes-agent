@@ -28,7 +28,7 @@ import time
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 ACP_MARKER_BASE_URL = "acp://cursor"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
@@ -45,10 +45,27 @@ def _resolve_command() -> str:
     )
 
 
+def _split_command(command: str) -> list[str]:
+    """Split a Cursor ACP command override into argv."""
+    parts = shlex.split((command or "").strip())
+    return parts or ["agent"]
+
+
+def _normalize_cursor_model(model: str | None) -> str | None:
+    """Return the model id expected by Cursor's `agent --model` flag."""
+    raw = (model or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("cursor/"):
+        raw = raw.split("/", 1)[1].strip()
+    if raw in {"default", "cursor-acp"}:
+        return None
+    return raw or None
+
+
 def _resolve_model() -> str | None:
     """Return the Cursor model to request via --model, or None for account default."""
-    raw = os.getenv("CURSOR_ACP_MODEL", "").strip()
-    return raw or None
+    return _normalize_cursor_model(os.getenv("CURSOR_ACP_MODEL", ""))
 
 
 def _resolve_args() -> list[str]:
@@ -352,19 +369,53 @@ class CursorACPClient:
         self.base_url = base_url or ACP_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
+        self._acp_command_argv = _split_command(self._acp_command)
         if acp_args or args:
             self._acp_args = list(acp_args or args or [])
         else:
             self._acp_args = _resolve_args()
-            # Allow per-instance model override
-            explicit_model = (acp_model or model or "").strip()
-            if explicit_model and self._acp_args == ["acp"]:
-                self._acp_args = ["--model", explicit_model, "acp"]
+        # Allow per-instance model override whenever the caller did not provide
+        # a fully custom command line. Auth discovery returns ["acp"], and the
+        # configured Hermes model must still become Cursor's --model flag.
+        explicit_model = _normalize_cursor_model(acp_model or model)
+        if explicit_model and self._acp_args == ["acp"]:
+            self._acp_args = ["--model", explicit_model, "acp"]
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self._on_text_delta: Callable[[str], None] | None = None
+        self._on_reasoning_delta: Callable[[str], None] | None = None
+        self._on_first_delta: Callable[[], None] | None = None
+        self._first_delta_fired = False
+
+    def set_stream_callbacks(
+        self,
+        *,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_reasoning_delta: Callable[[str], None] | None = None,
+        on_first_delta: Callable[[], None] | None = None,
+    ) -> None:
+        """Wire live chunk delivery for WebUI/gateway stream consumers."""
+        self._on_text_delta = on_text_delta
+        self._on_reasoning_delta = on_reasoning_delta
+        self._on_first_delta = on_first_delta
+        self._first_delta_fired = False
+
+    def clear_stream_callbacks(self) -> None:
+        self.set_stream_callbacks()
+
+    def _maybe_fire_first_delta(self) -> None:
+        if self._first_delta_fired:
+            return
+        self._first_delta_fired = True
+        first_cb = self._on_first_delta
+        if first_cb is not None:
+            try:
+                first_cb()
+            except Exception:
+                pass
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -443,7 +494,7 @@ class CursorACPClient:
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
         try:
             proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
+                self._acp_command_argv + self._acp_args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -455,7 +506,8 @@ class CursorACPClient:
         except FileNotFoundError as exc:
             raise RuntimeError(
                 f"Could not start Cursor ACP command '{self._acp_command}'. "
-                "Install Cursor CLI (npm install -g @cursor/agent) or set CURSOR_ACP_COMMAND/CURSOR_CLI_PATH."
+                "Install Cursor Agent CLI (`curl https://cursor.com/install -fsS | bash`), "
+                "run `agent login`, or set CURSOR_ACP_COMMAND/CURSOR_CLI_PATH."
             ) from exc
 
         if proc.stdin is None or proc.stdout is None:
@@ -565,7 +617,7 @@ class CursorACPClient:
             )
             if auth_result and not auth_result.get("success", True):
                 raise RuntimeError(
-                    "Cursor ACP authentication failed. Run 'cursor login' first."
+                    "Cursor ACP authentication failed. Run 'agent login' first."
                 )
 
             # Step 3: Create session
@@ -623,9 +675,23 @@ class CursorACPClient:
             if isinstance(content, dict):
                 chunk_text = str(content.get("text") or "")
             if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
+                self._maybe_fire_first_delta()
                 text_parts.append(chunk_text)
+                cb = self._on_text_delta
+                if cb is not None:
+                    try:
+                        cb(chunk_text)
+                    except Exception:
+                        pass
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
+                self._maybe_fire_first_delta()
                 reasoning_parts.append(chunk_text)
+                cb = self._on_reasoning_delta
+                if cb is not None:
+                    try:
+                        cb(chunk_text)
+                    except Exception:
+                        pass
             return True
 
         if process.stdin is None:
