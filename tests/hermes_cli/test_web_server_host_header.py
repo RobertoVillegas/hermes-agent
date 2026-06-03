@@ -215,3 +215,52 @@ class TestWebSocketHostOriginGuard:
             },
         ):
             pass
+
+    def test_remote_electron_file_origin_is_accepted_with_valid_token(self, monkeypatch):
+        """Packaged Desktop uses file:// origins even for remote dashboards.
+
+        Remote Desktop over Tailscale/LAN binds the dashboard to 0.0.0.0, while
+        Electron still opens /api/ws from a file:// renderer. The session token
+        is validated before the Host/Origin guard, so this non-web Origin should
+        not be rejected solely because the dashboard is bound to a non-loopback
+        interface.
+        """
+        from fastapi.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "0.0.0.0", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with client.websocket_connect(
+            url,
+            headers={
+                "Host": "100.64.0.10:9119",
+                "Origin": "file://",
+            },
+        ):
+            pass
+
+    def test_remote_electron_file_origin_still_requires_valid_token(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "0.0.0.0", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+
+        client = TestClient(ws.app)
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                "/api/events?token=wrong-token&channel=security-test",
+                headers={
+                    "Host": "100.64.0.10:9119",
+                    "Origin": "file://",
+                },
+            ):
+                pass
+
+        assert exc.value.code == 4401

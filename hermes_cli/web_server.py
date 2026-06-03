@@ -6606,10 +6606,11 @@ def _ws_host_origin_is_allowed(ws: "WebSocket") -> bool:
         # Packaged Electron loads the desktop renderer over file://, so its
         # WebSocket handshake carries a non-web Origin such as file:// or null.
         # DNS-rebinding attacks originate from an http(s) site; they cannot
-        # forge a file:// origin and still hold the loopback session token.
-        # Public/gated binds have no legitimate non-web client, so keep
-        # rejecting these origins there.
-        return bound_host.lower() in _LOOPBACK_HOST_VALUES
+        # forge a file:// origin and still hold the session token. Remote
+        # Desktop connections over trusted networks/Tailscale use the same
+        # high-entropy token on /api/ws, so allow Electron's non-web Origin
+        # here; _ws_auth_ok() still validates the token before this guard.
+        return True
 
     if not parsed.netloc:
         return False
